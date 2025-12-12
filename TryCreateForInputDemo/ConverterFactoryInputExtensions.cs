@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -10,557 +10,735 @@ using SharpCompress.Archives;
 namespace GitConverter.Lib.Factories
 {
     /// <summary>
-    /// Helpers to pick a converter from an input path (file or archive).
-    /// Consumers can call TryCreateForInput to get an IConverter resolved from an IConverterFactory
-    /// by inspecting the input path (without extracting archives).
+    /// Provides extension methods for automatic GIS format detection and converter resolution.
+    /// Supports both single files and archives with header-based classification for ambiguous formats.
     /// </summary>
-    /// <remarks>
-    /// Responsibilities
-    /// - Validate and interpret the provided input path (single file or archive) and choose an appropriate
-    ///   converter key that can be passed to an <see cref="IConverterFactory"/> instance.
-    /// - For archive inputs prefer filename/listing-only inspection (via <see cref="ConverterUtils.TryListArchiveEntries"/>)
-    ///   to avoid extraction; when archive entries are only generic .json files this type will perform bounded
-    ///   header reads of .json entries (streaming reads only) and apply the same JSON classification used for single files.
-    ///
-    /// Detection & selection summary
-    /// - Single-file inputs:
-    ///   - Use explicit extension-to-converter mapping for known extensions (for example .geojson and .esrijson).
-    ///   - For generic .json files attempt a best-effort classification:
-    ///     - Call <c>JsonFormatDetector.DetectFromFile</c> when available.
-    ///     - Fall back to a bounded UTF‑8 header read (see <c>HeaderReadLimit</c>) and classify with <c>ClassifyJsonHeader</c>.
-    ///     - GeoJSON sequence / NDJSON is only selected when the header contains at least <c>NdjsonThreshold</c> JSON-like lines.
-    ///     - TopoJSON is detected via header fingerprints (Topological "type" + "topology") rather than relying on a distinct file suffix.
-    /// - Archive inputs:
-    ///   - Inspect entry names (no extraction) and collect extension/marker information (e.g. .shp, .gdb, .kml, .json).
-    ///   - KMZ guard: prefer "Kmz" when the outer archive filename ends with .kmz or a top-level doc.kml entry exists.
-    ///   - If the archive contains only generic .json entries this class will open each .json entry stream and
-    ///     perform bounded header classification per entry, then apply a majority vote to choose between
-    ///     GeoJson / EsriJson / GeoJsonSeq / TopoJson. A tied vote returns failure (ambiguous).
-    ///   - Otherwise apply strict requirement matching: a rule wins when all required markers are present.
-    ///
-    /// Safety & performance
-    /// - Header reads are bounded by <c>HeaderReadLimit</c> to avoid loading large files into memory.
-    /// - Archive entry reads use streaming reads from SharpCompress and only pull up to the same head limit.
-    /// - The extension inspection phase avoids opening archives where possible; only the minimal set of entry
-    ///   streams is opened when necessary to disambiguate JSON flavors.
-    ///
-    /// Logging & traceability
-    /// - Methods return a detector reason string to assist callers with logging and diagnostics.
-    /// - The implementation logs major detection decisions and reasons via <see cref="Log"/>.
-    ///
-    /// Error handling
-    /// - Friendly failure behavior: the method returns false when detection fails or is ambiguous and sets
-    ///   <paramref name="detectReason"/> to a human-readable explanation. It does not throw for expected validation errors.
-    /// - Unexpected exceptions are caught, logged and surfaced via the returned detect reason and a false return value.
-    ///
-    /// Unit testing
-    /// - Tests should exercise both archive filename-only heuristics and the JSON-entry voting logic.
-    /// - When testing archive JSON voting use small synthetic archives with controlled .json entries to produce deterministic votes.
-    /// - Tests should assert on stable substrings of the detector reason for resilience against minor wording changes.
-    /// </remarks>
     public static class ConverterFactoryInputExtensions
     {
+        /// <summary>
+        /// Minimum number of consecutive JSON lines required to classify content as NDJSON format.
+        /// </summary>
         private const int NdjsonThreshold = 2;
-        private const int HeaderReadLimit = 64 * 1024; // 64 KB
 
-        // Minimal extension->converter map.
-        private static readonly Dictionary<string, string> _s_extensionToConverter = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            { ".geojson", "GeoJson" },
-            { ".esrijson", "EsriJson" },
-            { ".kml", "Kml" },
-            { ".kmz", "Kmz" },
-            { ".shp", "Shapefile" },
-            { ".osm", "Osm" },
-            { ".gpx", "Gpx" },
-            { ".gml", "Gml" },
-            { ".gdb", "Gdb" },
-            { ".mif", "MapInfoInterchange" },
-            { ".tab", "MapInfoTab" },
-            { ".map", "MapInfoTab" },
-            { ".dat", "MapInfoTab" },
-            { ".id", "MapInfoTab" },
-            { ".csv", "Csv" },
-            { ".gpkg", "GeoPackage" },
-         };
+        /// <summary>
+        /// Maximum bytes to read from file headers for format classification (8 KB).
+        /// Sufficient to classify JSON structure without loading entire files into memory.
+        /// </summary>
+        private const int HeaderReadLimit = 8 * 1024;
 
-        // Archive requirements.
-        // Note: entries that only rely on the generic ".json" suffix are intentionally NOT added here
-        // (they are disambiguated by header sniffing / voting instead). TopoJson is detected by header fingerprints.
-        private static readonly Dictionary<string, string[]> _s_archiveRequirements = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        /// <summary>
+        /// Minimum header size required for reliable JSON classification (512 bytes).
+        /// Based on typical structure sizes:
+        /// - GeoJSON feature: ~100-200 bytes (type + coordinates)
+        /// - EsriJSON feature: ~150-300 bytes (spatialReference + attributes)
+        /// - TopoJSON: ~200-400 bytes (topology header)
+        /// - NDJSON: 2+ lines × 50 bytes average = 100+ bytes
+        /// Provides safety margin for minified or compact JSON.
+        /// </summary>
+        private const int MinJsonParseBytes = 512;
+
+        /// <summary>
+        /// Maximum number of non-JSON lines allowed in NDJSON content.
+        /// Permits comments and blank lines while maintaining format integrity.
+        /// </summary>
+        private const int MaxNonJsonLinesInNdjson = 2;
+
+        /// <summary>
+        /// Centralized format descriptors for all supported GIS formats.
+        /// Maps format names to their file extensions and archive requirements.
+        /// </summary>
+        private static readonly IReadOnlyDictionary<string, FormatDescriptor> Formats =
+            new Dictionary<string, FormatDescriptor>(StringComparer.OrdinalIgnoreCase)
         {
-            { "EsriJson",     new[] { ".esrijson" } },
-            { "Gml",          new[] { ".gml" } },
-            { "GeoJson",      new[] { ".geojson" } },
-            { "Kml",          new[] { ".kml" } },
-            { "Kmz",          new[] { ".kml" } },
-            { "Shapefile",    new[] { ".shp", ".shx", ".dbf" } },
-            { "Osm",          new[] { ".osm" } },
-            { "Gdb",          new[] { ".gdb" } },
-            { "Gpx",          new[] { ".gpx" } },
-            { "MapInfoInterchange", new[] { ".mif" } },
-            { "MapInfoTab",         new[] { ".tab", ".dat", ".map", ".id" } },
-            { "Csv",          new[] { ".csv" } },
-            { "GeoPackage",   new[] { ".gpkg" } },
+            { "GeoJson", new FormatDescriptor("GeoJson", new[] { ".geojson" }, new[] { ".geojson" }) },
+            { "EsriJson", new FormatDescriptor("EsriJson", new[] { ".esrijson" }, new[] { ".esrijson" }) },
+            { "GeoJsonSeq", new FormatDescriptor("GeoJsonSeq", new[] { ".jsonl", ".ndjson" }, Array.Empty<string>()) },
+            { "TopoJson", new FormatDescriptor("TopoJson", new[] { ".topojson" }, Array.Empty<string>()) },
+            { "Kml", new FormatDescriptor("Kml", new[] { ".kml" }, new[] { ".kml" }) },
+            { "Kmz", new FormatDescriptor("Kmz", new[] { ".kmz" }, new[] { ".kml" }) },
+            { "Shapefile", new FormatDescriptor("Shapefile", new[] { ".shp" }, new[] { ".shp", ".shx", ".dbf" }) },
+            { "Osm", new FormatDescriptor("Osm", new[] { ".osm" }, new[] { ".osm" }) },
+            { "Gpx", new FormatDescriptor("Gpx", new[] { ".gpx" }, new[] { ".gpx" }) },
+            { "Gml", new FormatDescriptor("Gml", new[] { ".gml" }, new[] { ".gml" }) },
+            { "Gdb", new FormatDescriptor("Gdb", new[] { ".gdb" }, new[] { ".gdb" }) },
+            { "MapInfoInterchange", new FormatDescriptor("MapInfoInterchange", new[] { ".mif" }, new[] { ".mif" }) },
+            { "MapInfoTab", new FormatDescriptor("MapInfoTab", new[] { ".tab", ".map", ".dat", ".id" }, new[] { ".tab", ".dat", ".map", ".id" }) },
+            { "Csv", new FormatDescriptor("Csv", new[] { ".csv" }, new[] { ".csv" }) },
+            { "GeoPackage", new FormatDescriptor("GeoPackage", new[] { ".gpkg" }, new[] { ".gpkg" }) },
         };
 
         /// <summary>
-        /// Inspect the input path (file or archive) and attempt to resolve a converter from the factory.
-        /// Lightweight overload that returns only the converter. For diagnostics use the overload that returns detectReason.
+        /// Describes a GIS format with associated file extensions and archive validation requirements.
         /// </summary>
-        /// <param name="factory">Factory used to resolve a converter key to an <see cref="IConverter"/> instance.</param>
-        /// <param name="gisInputFilePath">Path to a single GIS file or archive to inspect.</param>
-        /// <param name="converter">When true is returned this parameter contains the resolved converter instance.</param>
-        /// <returns>True when a converter was successfully resolved; false otherwise.</returns>
-        /// <remarks>
-        /// - This overload simply forwards to <see cref="TryCreateForInput(IConverterFactory,string,out,IConverter,out,string)"/>.
-        /// - Prefer the overload that returns <paramref name="detectReason"/> when you need logging/diagnostics about the detection step.
-        /// </remarks>
-        public static bool TryCreateForInput(this IConverterFactory factory, string gisInputFilePath, out IConverter converter)
+        internal sealed class FormatDescriptor
         {
-            string ignored;
-            return TryCreateForInput(factory, gisInputFilePath, out converter, out ignored);
+            /// <summary>
+            /// Gets the format name (e.g., "GeoJson", "Shapefile").
+            /// </summary>
+            public string Name { get; }
+
+            /// <summary>
+            /// Gets the list of file extensions associated with this format.
+            /// </summary>
+            public IReadOnlyList<string> FileExtensions { get; }
+
+            /// <summary>
+            /// Gets the list of required extensions that must be present in an archive for format validation.
+            /// </summary>
+            public IReadOnlyList<string> ArchiveRequirements { get; }
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="FormatDescriptor"/> class.
+            /// </summary>
+            /// <param name="name">The format name.</param>
+            /// <param name="fileExts">The file extensions for this format.</param>
+            /// <param name="archiveReqs">The required extensions for archive validation.</param>
+            /// <exception cref="ArgumentNullException">Thrown when <paramref name="name"/> is null.</exception>
+            public FormatDescriptor(string name, string[] fileExts, string[] archiveReqs)
+            {
+                Name = name ?? throw new ArgumentNullException(nameof(name));
+                FileExtensions = fileExts ?? Array.Empty<string>();
+                ArchiveRequirements = archiveReqs ?? Array.Empty<string>();
+            }
+
+            /// <summary>
+            /// Determines whether the specified extension matches any of this format's file extensions.
+            /// </summary>
+            /// <param name="extension">The file extension to check.</param>
+            /// <returns><c>true</c> if the extension matches; otherwise, <c>false</c>.</returns>
+            public bool MatchesFileExtension(string extension)
+            {
+                return FileExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase);
+            }
+
+            /// <summary>
+            /// Determines whether all archive requirements are satisfied by the discovered extensions.
+            /// </summary>
+            /// <param name="discoveredExtensions">The set of extensions found in the archive.</param>
+            /// <returns><c>true</c> if all requirements are met; otherwise, <c>false</c>.</returns>
+            public bool MatchesArchiveRequirements(ISet<string> discoveredExtensions)
+            {
+                return ArchiveRequirements.All(req => discoveredExtensions.Contains(req));
+            }
         }
 
         /// <summary>
-        /// Inspect the input path (file or archive) and attempt to resolve a converter from the factory.
+        /// Attempts to create a converter for the specified GIS input file path.
+        /// Lightweight overload without diagnostic information.
         /// </summary>
-        /// <param name="factory">Factory used to resolve a converter key to an <see cref="IConverter"/> instance.</param>
-        /// <param name="gisInputFilePath">Path to a single GIS file or archive to inspect.</param>
-        /// <param name="converter">Out parameter populated with the resolved converter when the method returns true.</param>
-        /// <param name="detectReason">Human friendly reason describing how the converter was selected (useful for logging).</param>
-        /// <returns>True when a converter was resolved; false when detection failed or result was ambiguous.</returns>
-        /// <remarks>
-        /// Behaviour details
-        /// - Returns false and sets <paramref name="detectReason"/> when:
-        ///   - The input path is invalid or cannot be inspected.
-        ///   - Archive inspection is ambiguous (for example tied JSON votes).
-        ///   - No matching converter mapping or requirement rules are found.
-        /// - Detection steps (high-level):
-        ///   1. If the input looks like an archive (see <see cref="ConverterUtils.IsArchiveFile"/>):
-        ///      a. Use <see cref="ConverterUtils.TryListArchiveEntries"/> to obtain entry names (no extraction).
-        ///      b. Build a set of discovered extensions / markers and apply fast "wins" (explicit .geojson/.esrijson).
-        ///      c. Apply the KMZ guard (outer .kmz or top-level doc.kml => Kmz).
-        ///      d. If archive contains only generic .json entries, open each .json entry and perform bounded header reads
-        ///         (see <c>ReadEntryHeadUtf8</c>) and classify via <c>ClassifyJsonHeader</c>; then apply majority voting.
-        ///      e. Otherwise apply strict requirement matching against <see cref="_s_archiveRequirements"/>.
-        ///   2. For single-file inputs:
-        ///      a. Use explicit extension mapping for .geojson and .esrijson.
-        ///      b. For generic .json files invoke <c>JsonFormatDetector.DetectFromFile</c> (if available) then fall back
-        ///         to a bounded header read + <c>ClassifyJsonHeader</c>.
-        ///      c. Map the detected JSON format to a converter key (GeoJson / EsriJson / GeoJsonSeq / TopoJson).
-        ///
-        /// Safety and IO
-        /// - This method avoids extracting archive contents. When entry-stream reads are required they are bounded
-        ///   to <c>HeaderReadLimit</c> bytes and performed via streaming to minimize memory usage.
-        /// - Unexpected exceptions are caught; the method logs details and returns false with a detect reason describing the problem.
-        /// </remarks>
-        public static bool TryCreateForInput(this IConverterFactory factory, string gisInputFilePath, out IConverter converter, out string detectReason)
+        /// <param name="factory">The converter factory to use.</param>
+        /// <param name="gisInputFilePath">The path to the GIS input file.</param>
+        /// <param name="converter">When successful, contains the created converter; otherwise, <c>null</c>.</param>
+        /// <returns><c>true</c> if converter creation succeeded; otherwise, <c>false</c>.</returns>
+        public static bool TryCreateForInput(
+            this IConverterFactory factory,
+            string gisInputFilePath,
+            out IConverter converter)
         {
-            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            return TryCreateForInput(factory, gisInputFilePath, out converter, out _);
+        }
+
+        /// <summary>
+        /// Attempts to create a converter for the specified GIS input file path with detailed diagnostic information.
+        /// </summary>
+        /// <param name="factory">The converter factory to use.</param>
+        /// <param name="gisInputFilePath">The path to the GIS input file.</param>
+        /// <param name="converter">When successful, contains the created converter; otherwise, <c>null</c>.</param>
+        /// <param name="detectReason">Contains diagnostic information about the detection process.</param>
+        /// <returns><c>true</c> if converter creation succeeded; otherwise, <c>false</c>.</returns>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="factory"/> is null.</exception>
+        /// <remarks>
+        /// Detection priority:
+        /// 1. Archives: Fast-path extension checks → KMZ detection → JSON voting → requirement matching
+        /// 2. Single files: Explicit extension mapping → JSON format detection (with fallback) → generic extension mapping
+        /// 
+        /// All file reads are bounded and streaming. Archives are never extracted to disk.
+        /// </remarks>
+        public static bool TryCreateForInput(
+            this IConverterFactory factory,
+            string gisInputFilePath,
+            out IConverter converter,
+            out string detectReason)
+        {
             converter = null;
             detectReason = null;
 
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+
+            // Validate input path is not null or empty
             if (string.IsNullOrWhiteSpace(gisInputFilePath))
             {
-                Log.Error("TryCreateForInput: input path required.");
+                detectReason = "input path is null or whitespace";
+                Log.Error($"TryCreateForInput: {detectReason}");
+                return false;
+            }
+
+            // Validate file exists
+            if (!File.Exists(gisInputFilePath))
+            {
+                detectReason = $"file does not exist: {gisInputFilePath}";
+                Log.Error($"TryCreateForInput: {detectReason}");
+                return false;
+            }
+
+            // Validate file is not empty
+            FileInfo fileInfo;
+            try
+            {
+                fileInfo = new FileInfo(gisInputFilePath);
+            }
+            catch (Exception ex)
+            {
+                detectReason = $"failed to get file info: {ex.Message}";
+                Log.Error($"TryCreateForInput: {detectReason}", ex);
+                return false;
+            }
+
+            if (fileInfo.Length == 0)
+            {
+                detectReason = "file is empty (0 bytes)";
+                Log.Warn($"TryCreateForInput: {detectReason}");
                 return false;
             }
 
             try
             {
-                // Archive case: inspect names first (do NOT extract files). If only generic .json markers are present
-                // fall back to bounded header reads of .json entries and perform majority voting.
-                if (ConverterUtils.IsArchiveFile(gisInputFilePath))
-                {
-                    var entries = ConverterUtils.TryListArchiveEntries(gisInputFilePath);
-                    if (entries == null)
-                    {
-                        detectReason = "Failed to list archive entries.";
-                        Log.Debug(detectReason);
-                        return false;
-                    }
-
-                    var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    bool hasTopLevelDocKml = false;
-
-                    foreach (var e in entries ?? Enumerable.Empty<string>())
-                    {
-                        if (string.IsNullOrWhiteSpace(e)) continue;
-                        var entryExt = Path.GetExtension(e);
-                        if (!string.IsNullOrEmpty(entryExt))
-                            exts.Add(entryExt.ToLowerInvariant());
-
-                        var normalized = e.Replace('\\', '/').Trim('/');
-                        if (string.Equals(normalized, "doc.kml", StringComparison.OrdinalIgnoreCase))
-                            hasTopLevelDocKml = true;
-
-                        var segments = normalized.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
-                        foreach (var seg in segments)
-                        {
-                            var idx = seg.LastIndexOf('.');
-                            if (idx > 0 && idx < seg.Length - 1)
-                                exts.Add(seg.Substring(idx).ToLowerInvariant());
-
-                            if (seg.EndsWith(".gdb", StringComparison.OrdinalIgnoreCase))
-                                exts.Add(".gdb");
-                        }
-                    }
-
-                    string outerExt = string.Empty;
-                    try { outerExt = Path.GetExtension(gisInputFilePath) ?? string.Empty; } catch { /* ignore */ }
-
-                    bool kmzGuardPassed = string.Equals(outerExt, ".kmz", StringComparison.OrdinalIgnoreCase) || hasTopLevelDocKml;
-
-                    // Fast wins from explicit archive entry extensions (without opening entries)
-                    if (exts.Contains(".geojson"))
-                    {
-                        detectReason = "Archive filename contains .geojson entries";
-                        return factory.TryCreate("GeoJson", out converter);
-                    }
-
-                    if (exts.Contains(".esrijson"))
-                    {
-                        detectReason = "Archive filename contains .esrijson entries";
-                        return factory.TryCreate("EsriJson", out converter);
-                    }
-
-                    // KMZ guard
-                    if (kmzGuardPassed)
-                    {
-                        if (string.Equals(outerExt, ".kmz", StringComparison.OrdinalIgnoreCase) || hasTopLevelDocKml)
-                        {
-                            detectReason = "KMZ guard detected (outer .kmz or top-level doc.kml)";
-                            return factory.TryCreate("Kmz", out converter);
-                        }
-                    }
-
-                    // If archive contains only .json markers (no more specific filename indicators),
-                    // open .json entries and perform header-based classification + voting (bounded reads).
-                    if (exts.Contains(".json") && !exts.Overlaps(new[] { ".geojson", ".esrijson" }))
-                    {
-                        try
-                        {
-                            var votes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-                            using (var arc = ArchiveFactory.Open(gisInputFilePath))
-                            {
-                                foreach (var entry in arc.Entries.Where(en => !en.IsDirectory))
-                                {
-                                    var entryName = Path.GetFileName(entry.Key ?? string.Empty);
-                                    if (string.IsNullOrEmpty(entryName)) continue;
-                                    if (!entryName.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) continue;
-
-                                    try
-                                    {
-                                        var head = ReadEntryHeadUtf8(entry, HeaderReadLimit);
-                                        var fmt = ClassifyJsonHeader(head);
-                                        switch (fmt)
-                                        {
-                                            case JsonFormatDetector.Format.TopoJson:
-                                                votes.TryGetValue("TopoJson", out var t); votes["TopoJson"] = t + 1;
-                                                break;
-                                            case JsonFormatDetector.Format.EsriJson:
-                                                votes.TryGetValue("EsriJson", out var e); votes["EsriJson"] = e + 1;
-                                                break;
-                                            case JsonFormatDetector.Format.GeoJsonSeq:
-                                                votes.TryGetValue("GeoJsonSeq", out var s); votes["GeoJsonSeq"] = s + 1;
-                                                break;
-                                            case JsonFormatDetector.Format.GeoJson:
-                                                votes.TryGetValue("GeoJson", out var g); votes["GeoJson"] = g + 1;
-                                                break;
-                                            default:
-                                                break;
-                                        }
-                                    }
-                                    catch (Exception exEntry)
-                                    {
-                                        Log.Debug("JSON entry sniffing failed for '" + entry.Key + "': " + exEntry.Message);
-                                    }
-                                }
-                            }
-
-                            if (votes.Count > 0)
-                            {
-                                Log.Debug("JSON votes: " + string.Join(", ", votes.Select(kv => kv.Key + "=" + kv.Value)));
-                                var max = votes.Values.Max();
-                                var winners = votes.Where(kv => kv.Value == max).Select(kv => kv.Key).ToArray();
-                                if (winners.Length == 1)
-                                {
-                                    detectReason = "JSON voting majority (" + winners[0] + "=" + max + ") over entries: " + string.Join(", ", votes.Select(kv => kv.Key + "=" + kv.Value));
-                                    Log.Debug(detectReason);
-                                    return factory.TryCreate(winners[0], out converter);
-                                }
-
-                                // friendly failure (ambiguous)
-                                detectReason = "ambiguous JSON in archive—please specify format";
-                                Log.Warn("Ambiguous JSON types inside archive (tie in votes): " + string.Join(", ", votes.Select(kv => kv.Key + "=" + kv.Value)));
-                                converter = null;
-                                return false;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.Debug("Failed to perform JSON-entry voting for archive '" + gisInputFilePath + "': " + ex.Message);
-                            // fall through to requirement heuristics below
-                        }
-                    }
-
-                    // Strict requirement match
-                    foreach (var kv in _s_archiveRequirements)
-                    {
-                        if (string.Equals(kv.Key, "Kmz", StringComparison.OrdinalIgnoreCase) && !kmzGuardPassed)
-                            continue;
-
-                        var required = kv.Value;
-                        if (required.All(r => exts.Contains(r)))
-                        {
-                            detectReason = "Requirement match: " + kv.Key;
-                            return factory.TryCreate(kv.Key, out converter);
-                        }
-                    }
-
-                    detectReason = "No archive-based converter match found (based on filename inspection).";
-                    Log.Debug(detectReason);
-                    return false;
-                }
-
-                // Single-file handling
-                var ext = (Path.GetExtension(gisInputFilePath) ?? string.Empty).ToLowerInvariant();
-
-                // Direct extension routing for explicit JSON-type extensions (no NDJSON sniff)
-                // Note: TopoJSON commonly uses .json extension — rely on header sniff for .json files instead of requiring a dedicated suffix.
-                if (_s_extensionToConverter.TryGetValue(ext, out var mapped) && (ext == ".geojson" || ext == ".esrijson"))
-                {
-                    detectReason = $"Mapped extension '{ext}' to converter '{mapped}' (explicit mapping).";
-                    return factory.TryCreate(mapped, out converter);
-                }
-
-                // For .json files run detection with NDJSON rule (mirrors ConversionService)
-                if (!string.IsNullOrWhiteSpace(ext) && ext.EndsWith("json", StringComparison.OrdinalIgnoreCase))
-                {
-                    JsonFormatDetector.Format jsonFmt = JsonFormatDetector.Format.Unknown;
-                    string reason = null;
-                    try
-                    {
-                        jsonFmt = JsonFormatDetector.DetectFromFile(gisInputFilePath);
-                        if (jsonFmt != JsonFormatDetector.Format.Unknown)
-                            reason = "JsonFormatDetector.DetectFromFile";
-                    }
-                    catch (Exception detEx)
-                    {
-                        Log.Debug("JsonFormatDetector.DetectFromFile threw: " + detEx.Message + ". Will attempt lightweight header sniff.");
-                        jsonFmt = JsonFormatDetector.Format.Unknown;
-                    }
-
-                    if (jsonFmt == JsonFormatDetector.Format.Unknown)
-                    {
-                        var head = ReadHeadUtf8(gisInputFilePath, HeaderReadLimit);
-                        jsonFmt = ClassifyJsonHeader(head);
-                        if (jsonFmt == JsonFormatDetector.Format.GeoJsonSeq)
-                            reason = $"Header sniff: NDJSON heuristic (>= {NdjsonThreshold} JSON lines)";
-                        else if (jsonFmt == JsonFormatDetector.Format.TopoJson)
-                            reason = "Header sniff: TopoJSON fingerprint";
-                        else if (jsonFmt == JsonFormatDetector.Format.EsriJson)
-                            reason = "Header sniff: EsriJSON fingerprint";
-                        else if (jsonFmt == JsonFormatDetector.Format.GeoJson)
-                            reason = "Header sniff: GeoJSON fingerprint (Feature/coordinates/FeatureCollection)";
-                        else
-                            reason = "Header sniff: unknown";
-                    }
-
-                    if (jsonFmt == JsonFormatDetector.Format.Unknown)
-                    {
-                        detectReason = "Unable to determine JSON format (GeoJson / EsriJson / GeoJsonSeq / TopoJson).";
-                        Log.Error(detectReason);
-                        return false;
-                    }
-
-                    string converterKeyForJson = null;
-                    switch (jsonFmt)
-                    {
-                        case JsonFormatDetector.Format.GeoJson:
-                            converterKeyForJson = "GeoJson";
-                            break;
-                        case JsonFormatDetector.Format.EsriJson:
-                            converterKeyForJson = "EsriJson";
-                            break;
-                        case JsonFormatDetector.Format.GeoJsonSeq:
-                            converterKeyForJson = "GeoJsonSeq";
-                            break;
-                        case JsonFormatDetector.Format.TopoJson:
-                            converterKeyForJson = "TopoJson";
-                            break;
-                        default:
-                            converterKeyForJson = null;
-                            break;
-                    }
-
-                    if (string.IsNullOrWhiteSpace(converterKeyForJson))
-                    {
-                        detectReason = "Failed to map detected JSON format to a converter key.";
-                        Log.Error(detectReason);
-                        return false;
-                    }
-
-                    detectReason = $"Detected JSON format '{jsonFmt}' (reason: {reason}).";
-                    return factory.TryCreate(converterKeyForJson, out converter);
-                }
-
-                // Non-json extension mapping
-                if (!_s_extensionToConverter.TryGetValue(ext, out var converterKeyNonJson))
-                {
-                    detectReason = $"Unknown input file extension '{ext}'";
-                    Log.Warn(detectReason);
-                    return false;
-                }
-
-                detectReason = $"Mapped extension '{ext}' to converter '{converterKeyNonJson}' (extension mapping).";
-                return factory.TryCreate(converterKeyNonJson, out converter);
+                return ConverterUtils.IsArchiveFile(gisInputFilePath)
+                    ? TryDetectArchiveFormat(factory, gisInputFilePath, out converter, out detectReason)
+                    : TryDetectSingleFileFormat(factory, gisInputFilePath, out converter, out detectReason);
             }
             catch (Exception ex)
             {
-                detectReason = "Unexpected error in TryCreateForInput: " + ex.Message;
+                detectReason = $"unexpected error during format detection: {ex.GetType().Name} - {ex.Message}";
                 Log.Error(detectReason, ex);
-                converter = null;
                 return false;
             }
         }
 
         /// <summary>
-        /// Heuristic to detect newline-delimited JSON (NDJSON / GeoJSON sequence) from the head text.
+        /// Attempts to detect the GIS format from an archive file without extraction.
         /// </summary>
-        /// <param name="text">Snippet of UTF-8 decoded file content (head bytes).</param>
-        /// <param name="threshold">Minimum JSON-like lines required to consider NDJSON.</param>
-        /// <returns>True when the text looks like NDJSON; otherwise false.</returns>
-        /// <remarks>
-        /// Implementation notes:
-        /// - Counts non-empty lines that start with '{' or '[' up to the provided threshold.
-        /// - Stops early when a non-JSON-like line is encountered.
-        /// - Designed to run on bounded header reads only (cheap, safe).
-        /// </remarks>
-        private static bool LooksLikeNdjson(string text, int threshold = NdjsonThreshold)
+        /// <param name="factory">The converter factory to use.</param>
+        /// <param name="archivePath">The path to the archive file.</param>
+        /// <param name="converter">When successful, contains the created converter; otherwise, <c>null</c>.</param>
+        /// <param name="detectReason">Contains diagnostic information about the detection process.</param>
+        /// <returns><c>true</c> if format detection and converter creation succeeded; otherwise, <c>false</c>.</returns>
+        private static bool TryDetectArchiveFormat(
+            IConverterFactory factory,
+            string archivePath,
+            out IConverter converter,
+            out string detectReason)
         {
-            if (string.IsNullOrWhiteSpace(text)) return false;
+            converter = null;
 
-            int count = 0;
-            using (var sr = new StringReader(text))
+            var entries = ConverterUtils.TryListArchiveEntries(archivePath);
+            if (entries == null || !entries.Any())
             {
-                string line;
-                while ((line = sr.ReadLine()) != null)
+                detectReason = "failed to list archive entries or archive is empty";
+                Log.Warn($"archive detection failed: {detectReason}");
+                return false;
+            }
+
+            var discoveredExts = CollectExtensionsFromEntries(entries, out var hasTopLevelDocKml);
+            var outerExt = (Path.GetExtension(archivePath) ?? string.Empty).ToLowerInvariant();
+
+            // Fast-path: Explicit JSON variant extensions bypass voting
+            if (TryMatchExplicitJsonExtension(discoveredExts, out var jsonFormat))
+            {
+                detectReason = $"archive contains {jsonFormat} entries";
+                return factory.TryCreate(jsonFormat, out converter);
+            }
+
+            // KMZ detection via outer extension or presence of doc.kml
+            if (IsKmzArchive(outerExt, hasTopLevelDocKml))
+            {
+                detectReason = outerExt == ".kmz"
+                    ? "archive has .kmz extension"
+                    : "archive contains top-level doc.kml (KMZ structure)";
+                return factory.TryCreate("Kmz", out converter);
+            }
+
+            // Generic .json files require header-based voting
+            if (discoveredExts.Contains(".json"))
+            {
+                var jsonEntries = entries.Where(e => e.EndsWith(".json", StringComparison.OrdinalIgnoreCase));
+                var voteResult = VoteOnJsonEntries(archivePath, jsonEntries);
+
+                if (voteResult.IsSuccess)
                 {
-                    line = line.Trim();
-                    if (line.Length == 0) continue;
-                    if (line.StartsWith("{") || line.StartsWith("["))
-                    {
-                        if (++count >= threshold) return true;
-                    }
-                    else
-                    {
-                        break;
-                    }
+                    detectReason = $"json voting: {voteResult.Reason}";
+                    Log.Debug($"archive json detection: {detectReason}");
+                    return factory.TryCreate(voteResult.Winner, out converter);
+                }
+
+                detectReason = $"json format ambiguous in archive: {voteResult.Reason}";
+                Log.Warn(detectReason);
+                return false;
+            }
+
+            // Fallback: Strict requirement matching for non-JSON formats
+            foreach (var fmt in Formats.Values.Where(f => f.ArchiveRequirements.Count > 0 && f.Name != "Kmz"))
+            {
+                if (fmt.MatchesArchiveRequirements(discoveredExts))
+                {
+                    detectReason = $"archive requirements met for {fmt.Name}: {string.Join(", ", fmt.ArchiveRequirements)}";
+                    return factory.TryCreate(fmt.Name, out converter);
                 }
             }
+
+            detectReason = $"no format matched archive contents (extensions found: {string.Join(", ", discoveredExts)})";
+            Log.Warn(detectReason);
             return false;
         }
 
         /// <summary>
-        /// Classify a JSON head string into a JSON GIS format.
+        /// Attempts to detect the GIS format from a single file.
         /// </summary>
-        /// <param name="head">UTF-8 decoded head of the file / entry (bounded by <c>HeaderReadLimit</c>).</param>
-        /// <returns>Detected <see cref="JsonFormatDetector.Format"/> or <see cref="JsonFormatDetector.Format.Unknown"/> when uncertain.</returns>
-        /// <remarks>
-        /// - Uses simple substring heuristics that are intentionally conservative and case-insensitive.
-        /// - The classifier prioritizes TopoJSON (presence of "type" + "topology"), then EsriJSON markers,
-        ///   then NDJSON heuristic, and finally GeoJSON object signatures.
-        /// - Keep this small and deterministic to avoid false positives on truncated headers.
-        /// </remarks>
-        private static JsonFormatDetector.Format ClassifyJsonHeader(string head)
+        /// <param name="factory">The converter factory to use.</param>
+        /// <param name="filePath">The path to the file.</param>
+        /// <param name="converter">When successful, contains the created converter; otherwise, <c>null</c>.</param>
+        /// <param name="detectReason">Contains diagnostic information about the detection process.</param>
+        /// <returns><c>true</c> if format detection and converter creation succeeded; otherwise, <c>false</c>.</returns>
+        private static bool TryDetectSingleFileFormat(
+            IConverterFactory factory,
+            string filePath,
+            out IConverter converter,
+            out string detectReason)
         {
-            if (string.IsNullOrWhiteSpace(head)) return JsonFormatDetector.Format.Unknown;
+            converter = null;
+            var ext = (Path.GetExtension(filePath) ?? string.Empty).ToLowerInvariant();
 
-            if (head.IndexOf("\"type\"", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                head.IndexOf("\"topology\"", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (string.IsNullOrEmpty(ext))
+            {
+                detectReason = "file has no extension";
+                Log.Warn(detectReason);
+                return false;
+            }
+
+            // Fast-path: Explicit non-JSON extensions
+            var explicitFormat = Formats.Values.FirstOrDefault(f =>
+                f.MatchesFileExtension(ext) && !ext.Contains("json"));
+
+            if (explicitFormat != null)
+            {
+                detectReason = $"extension '{ext}' mapped to {explicitFormat.Name}";
+                return factory.TryCreate(explicitFormat.Name, out converter);
+            }
+
+            // JSON variants require content inspection
+            if (ext.EndsWith("json", StringComparison.OrdinalIgnoreCase))
+            {
+                var jsonFormat = DetectJsonFormat(filePath, out var jsonReason);
+
+                if (jsonFormat == JsonFormatDetector.Format.Unknown)
+                {
+                    detectReason = $"json format could not be determined: {jsonReason}";
+                    Log.Error(detectReason);
+                    return false;
+                }
+
+                var converterKey = MapJsonFormatToConverter(jsonFormat);
+                if (string.IsNullOrEmpty(converterKey))
+                {
+                    detectReason = $"no converter mapping for json format: {jsonFormat}";
+                    Log.Error(detectReason);
+                    return false;
+                }
+
+                detectReason = $"detected json format: {jsonFormat} ({jsonReason})";
+                return factory.TryCreate(converterKey, out converter);
+            }
+
+            detectReason = $"unknown file extension '{ext}'";
+            Log.Warn(detectReason);
+            return false;
+        }
+
+        /// <summary>
+        /// Collects all file extensions from archive entries, including nested paths and .gdb folders.
+        /// </summary>
+        /// <param name="entries">The archive entry paths to analyze.</param>
+        /// <param name="hasTopLevelDocKml">Set to <c>true</c> if a top-level doc.kml file is found (KMZ indicator).</param>
+        /// <returns>A set of lowercase file extensions found in the archive.</returns>
+        private static HashSet<string> CollectExtensionsFromEntries(
+            IEnumerable<string> entries,
+            out bool hasTopLevelDocKml)
+        {
+            var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            hasTopLevelDocKml = false;
+
+            foreach (var entryPath in entries)
+            {
+                if (string.IsNullOrWhiteSpace(entryPath)) continue;
+
+                var normalized = entryPath.Replace('\\', '/').Trim('/');
+
+                // Check for top-level doc.kml (KMZ indicator)
+                if (string.Equals(normalized, "doc.kml", StringComparison.OrdinalIgnoreCase))
+                    hasTopLevelDocKml = true;
+
+                // Extract all extensions from path segments (handles .gdb folders)
+                var segments = normalized.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var segment in segments)
+                {
+                    var ext = Path.GetExtension(segment);
+                    if (!string.IsNullOrEmpty(ext))
+                        extensions.Add(ext.ToLowerInvariant());
+                }
+            }
+
+            return extensions;
+        }
+
+        /// <summary>
+        /// Checks for explicit JSON variant extensions that bypass voting.
+        /// </summary>
+        /// <param name="extensions">The set of extensions to check.</param>
+        /// <param name="formatName">When successful, contains the format name; otherwise, <c>null</c>.</param>
+        /// <returns><c>true</c> if an explicit JSON extension was found; otherwise, <c>false</c>.</returns>
+        private static bool TryMatchExplicitJsonExtension(
+            ISet<string> extensions,
+            out string formatName)
+        {
+            formatName = null;
+
+            var explicitJsonFormats = new[]
+            {
+                (".geojson", "GeoJson"),
+                (".esrijson", "EsriJson"),
+                (".topojson", "TopoJson"),
+                (".jsonl", "GeoJsonSeq"),
+                (".ndjson", "GeoJsonSeq")
+            };
+
+            foreach (var (ext, format) in explicitJsonFormats)
+            {
+                if (extensions.Contains(ext))
+                {
+                    formatName = format;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Determines whether an archive is KMZ format based on outer extension or doc.kml presence.
+        /// </summary>
+        /// <param name="outerExtension">The archive file's extension.</param>
+        /// <param name="hasTopLevelDocKml">Whether a top-level doc.kml file was found.</param>
+        /// <returns><c>true</c> if the archive is KMZ format; otherwise, <c>false</c>.</returns>
+        private static bool IsKmzArchive(string outerExtension, bool hasTopLevelDocKml)
+        {
+            return outerExtension == ".kmz" || hasTopLevelDocKml;
+        }
+
+        /// <summary>
+        /// Performs header-based voting on JSON entries to determine the dominant format.
+        /// Uses format-specific tiebreaker when multiple formats receive equal votes.
+        /// </summary>
+        /// <param name="archivePath">The path to the archive file.</param>
+        /// <param name="jsonEntries">The JSON entry paths to vote on.</param>
+        /// <returns>A <see cref="VoteResult"/> containing the winning format or failure reason.</returns>
+        private static VoteResult VoteOnJsonEntries(string archivePath, IEnumerable<string> jsonEntries)
+        {
+            var votes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                using (var archive = ArchiveFactory.Open(archivePath))
+                {
+                    foreach (var entry in archive.Entries.Where(e => !e.IsDirectory))
+                    {
+                        var entryName = entry.Key ?? string.Empty;
+                        if (!jsonEntries.Contains(entryName, StringComparer.OrdinalIgnoreCase)) continue;
+
+                        try
+                        {
+                            var header = ReadEntryHeaderUtf8(entry, HeaderReadLimit);
+                            var format = ClassifyJsonContent(header);
+
+                            if (format != JsonFormatDetector.Format.Unknown)
+                            {
+                                var converterKey = MapJsonFormatToConverter(format);
+                                if (!string.IsNullOrEmpty(converterKey))
+                                {
+                                    votes.TryGetValue(converterKey, out var count);
+                                    votes[converterKey] = count + 1;
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Debug($"failed to classify json entry '{entryName}': {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return VoteResult.Failure($"archive reading failed: {ex.Message}");
+            }
+
+            if (votes.Count == 0)
+            {
+                return VoteResult.Failure("no json entries could be classified (all unknown or corrupted)");
+            }
+
+            var maxVotes = votes.Values.Max();
+            var winners = votes.Where(kv => kv.Value == maxVotes).Select(kv => kv.Key).ToArray();
+
+            // Tiebreaker: Prefer more specific/constrained formats over generic ones
+            // Priority: EsriJson (most specific) > TopoJson > GeoJson > GeoJsonSeq (most generic)
+            var tiebreakPriority = new[] { "EsriJson", "TopoJson", "GeoJson", "GeoJsonSeq" };
+            var winner = tiebreakPriority.FirstOrDefault(p => winners.Contains(p, StringComparer.OrdinalIgnoreCase))
+                         ?? winners.OrderBy(w => w).First(); // Fallback to alphabetical
+
+            var voteDetails = string.Join(", ", votes.Select(kv => $"{kv.Key}={kv.Value}"));
+            var reason = winners.Length > 1
+                ? $"{winner} wins {maxVotes}-vote tie via specificity tiebreaker (candidates: {string.Join(", ", winners)}; votes: {voteDetails})"
+                : $"{winner} wins with {maxVotes}/{votes.Values.Sum()} votes ({voteDetails})";
+
+            return VoteResult.Success(winner, reason);
+        }
+
+        /// <summary>
+        /// Encapsulates the result of a voting operation.
+        /// </summary>
+        private sealed class VoteResult
+        {
+            /// <summary>
+            /// Gets a value indicating whether the voting succeeded.
+            /// </summary>
+            public bool IsSuccess { get; }
+
+            /// <summary>
+            /// Gets the winning format name, or <c>null</c> if voting failed.
+            /// </summary>
+            public string Winner { get; }
+
+            /// <summary>
+            /// Gets the diagnostic reason describing the vote outcome.
+            /// </summary>
+            public string Reason { get; }
+
+            private VoteResult(bool success, string winner, string reason)
+            {
+                IsSuccess = success;
+                Winner = winner;
+                Reason = reason;
+            }
+
+            /// <summary>
+            /// Creates a successful vote result.
+            /// </summary>
+            public static VoteResult Success(string winner, string reason) => new VoteResult(true, winner, reason);
+
+            /// <summary>
+            /// Creates a failed vote result.
+            /// </summary>
+            public static VoteResult Failure(string reason) => new VoteResult(false, null, reason);
+        }
+
+        /// <summary>
+        /// Detects JSON format from a file using a fallback chain: JsonFormatDetector → header sniff.
+        /// </summary>
+        /// <param name="filePath">The path to the JSON file.</param>
+        /// <param name="reason">Contains diagnostic information about the detection method used.</param>
+        /// <returns>The detected JSON format, or <see cref="JsonFormatDetector.Format.Unknown"/> if detection failed.</returns>
+        private static JsonFormatDetector.Format DetectJsonFormat(string filePath, out string reason)
+        {
+            // Primary: Use JsonFormatDetector for full parsing
+            try
+            {
+                var format = JsonFormatDetector.DetectFromFile(filePath);
+                if (format != JsonFormatDetector.Format.Unknown)
+                {
+                    reason = "JsonFormatDetector.DetectFromFile (full parse)";
+                    return format;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"JsonFormatDetector.DetectFromFile failed: {ex.Message}; falling back to header sniff");
+            }
+
+            // Fallback: Bounded header read (handles large files)
+            var header = ReadFileHeaderUtf8(filePath, HeaderReadLimit);
+            var sniffed = ClassifyJsonContent(header);
+
+            reason = sniffed switch
+            {
+                JsonFormatDetector.Format.GeoJsonSeq => $"header sniff: ndjson pattern (>= {NdjsonThreshold} json lines)",
+                JsonFormatDetector.Format.TopoJson => "header sniff: topology object detected",
+                JsonFormatDetector.Format.EsriJson => "header sniff: esri json markers detected",
+                JsonFormatDetector.Format.GeoJson => "header sniff: geojson object detected",
+                _ => "header sniff: format unknown"
+            };
+
+            return sniffed;
+        }
+
+        /// <summary>
+        /// Classifies JSON content from a bounded header string using substring-based heuristics.
+        /// </summary>
+        /// <param name="content">The JSON content to classify.</param>
+        /// <returns>The detected JSON format, or <see cref="JsonFormatDetector.Format.Unknown"/> if classification failed.</returns>
+        /// <remarks>
+        /// Detection is heuristic-based and may produce false positives on:
+        /// - Truncated headers (less than <see cref="MinJsonParseBytes"/>)
+        /// - Keywords appearing in string values or comments
+        /// - Unusual JSON structures
+        ///
+        /// Priority order minimizes false positives:
+        /// 1. TopoJSON (most distinctive: requires "type" + "Topology")
+        /// 2. EsriJSON (distinctive: spatialReference OR geometryType)
+        /// 3. NDJSON (structural: multiple JSON objects per line)
+        /// 4. GeoJSON (common: FeatureCollection/Feature/coordinates)
+        /// </remarks>
+        private static JsonFormatDetector.Format ClassifyJsonContent(string content)
+        {
+            if (string.IsNullOrWhiteSpace(content) || content.Length < MinJsonParseBytes)
+                return JsonFormatDetector.Format.Unknown;
+
+            // Priority 1: TopoJSON (rare but highly distinctive)
+            if (content.IndexOf("\"type\"", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                content.IndexOf("\"Topology\"", StringComparison.Ordinal) >= 0)
                 return JsonFormatDetector.Format.TopoJson;
 
-            if (head.IndexOf("\"spatialReference\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                head.IndexOf("\"geometryType\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                head.IndexOf("\"attributes\"", StringComparison.OrdinalIgnoreCase) >= 0)
+            // Priority 2: EsriJSON (distinctive properties)
+            // Require spatialReference OR geometryType (both are Esri-specific)
+            bool hasSpatialRef = content.IndexOf("\"spatialReference\"", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool hasGeometryType = content.IndexOf("\"geometryType\"", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (hasSpatialRef || hasGeometryType)
                 return JsonFormatDetector.Format.EsriJson;
 
-            if (LooksLikeNdjson(head, NdjsonThreshold))
+            // Priority 3: NDJSON (structural pattern)
+            if (LooksLikeNdjson(content, NdjsonThreshold))
                 return JsonFormatDetector.Format.GeoJsonSeq;
 
-            if (head.IndexOf("\"FeatureCollection\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                head.IndexOf("\"Feature\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                head.IndexOf("\"coordinates\"", StringComparison.OrdinalIgnoreCase) >= 0)
+            // Priority 4: GeoJSON (most common, check last)
+            if (content.IndexOf("\"FeatureCollection\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf("\"Feature\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf("\"coordinates\"", StringComparison.OrdinalIgnoreCase) >= 0)
                 return JsonFormatDetector.Format.GeoJson;
 
             return JsonFormatDetector.Format.Unknown;
         }
 
         /// <summary>
-        /// Read up to <paramref name="maxBytes"/> bytes from the start of a file and return UTF-8 decoded text.
+        /// Determines whether content resembles NDJSON (newline-delimited JSON) format.
+        /// Allows limited non-JSON lines to handle comments and whitespace.
         /// </summary>
-        /// <param name="path">Path to the file to read.</param>
-        /// <param name="maxBytes">Maximum number of bytes to read from the start of the file.</param>
-        /// <returns>UTF-8 decoded string of the bytes actually read, or empty string on error.</returns>
-        /// <remarks>
-        /// - Uses FileShare.Read to allow other processes to read the file concurrently.
-        /// - Returns an empty string on any exception and logs the error at Debug level.
-        /// - Caller should pass a sensible <paramref name="maxBytes"/> (we use <c>HeaderReadLimit</c>).
-        /// </remarks>
-        private static string ReadHeadUtf8(string path, int maxBytes)
+        /// <param name="content">The content to analyze.</param>
+        /// <param name="threshold">The minimum number of JSON lines required.</param>
+        /// <returns><c>true</c> if content appears to be NDJSON format; otherwise, <c>false</c>.</returns>
+        private static bool LooksLikeNdjson(string content, int threshold)
+        {
+            if (string.IsNullOrWhiteSpace(content)) return false;
+
+            int jsonLineCount = 0;
+            int nonJsonLineCount = 0;
+
+            using (var reader = new StringReader(content))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    var trimmed = line.Trim();
+                    if (trimmed.Length == 0) continue; // Skip blank lines
+
+                    // Lines must start with { or [ to qualify as JSON
+                    if (trimmed[0] == '{' || trimmed[0] == '[')
+                    {
+                        if (++jsonLineCount >= threshold)
+                            return true;
+                    }
+                    else
+                    {
+                        // Allow limited non-JSON lines (comments, headers)
+                        if (++nonJsonLineCount > MaxNonJsonLinesInNdjson)
+                            return false;
+                    }
+                }
+            }
+
+            return jsonLineCount >= threshold;
+        }
+
+        /// <summary>
+        /// Maps <see cref="JsonFormatDetector.Format"/> enum values to converter key strings.
+        /// </summary>
+        /// <param name="format">The JSON format to map.</param>
+        /// <returns>The converter key string, or <c>null</c> for unknown formats.</returns>
+        private static string MapJsonFormatToConverter(JsonFormatDetector.Format format)
+        {
+            return format switch
+            {
+                JsonFormatDetector.Format.GeoJson => "GeoJson",
+                JsonFormatDetector.Format.EsriJson => "EsriJson",
+                JsonFormatDetector.Format.GeoJsonSeq => "GeoJsonSeq",
+                JsonFormatDetector.Format.TopoJson => "TopoJson",
+                _ => null // Unknown format
+            };
+        }
+
+        /// <summary>
+        /// Reads a bounded header from a file using streaming I/O (no full file load).
+        /// </summary>
+        /// <param name="path">The file path to read from.</param>
+        /// <param name="maxBytes">The maximum number of bytes to read.</param>
+        /// <returns>The UTF-8 decoded header content, or an empty string on error.</returns>
+        private static string ReadFileHeaderUtf8(string path, int maxBytes)
         {
             try
             {
-                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096))
                 {
-                    var toRead = (int)Math.Min(maxBytes, fs.Length);
-                    var buffer = new byte[toRead];
-                    var read = fs.Read(buffer, 0, toRead);
-                    return Encoding.UTF8.GetString(buffer, 0, read);
+                    var bytesToRead = (int)Math.Min(maxBytes, stream.Length);
+                    var buffer = new byte[bytesToRead];
+                    var bytesRead = stream.Read(buffer, 0, bytesToRead);
+                    return Encoding.UTF8.GetString(buffer, 0, bytesRead);
                 }
             }
             catch (Exception ex)
             {
-                Log.Debug("ReadHeadUtf8: failed to read head of '" + path + "': " + ex.Message);
+                Log.Debug($"ReadFileHeaderUtf8 failed for '{path}': {ex.Message}");
                 return string.Empty;
             }
         }
 
         /// <summary>
-        /// Read up to <paramref name="maxBytes"/> bytes from the start of an archive entry stream and return UTF-8 decoded text.
+        /// Reads a bounded header from an archive entry using streaming I/O (no extraction to disk).
         /// </summary>
-        /// <param name="entry">Archive entry to read.</param>
-        /// <param name="maxBytes">Maximum number of bytes to read from the entry stream.</param>
-        /// <returns>UTF-8 decoded string of the bytes actually read, or empty string on error.</returns>
-        /// <remarks>
-        /// - Per-entry reads are streaming (no extraction) and bounded to avoid excessive memory usage.
-        /// - Returns an empty string on error and logs a Debug message.
-        /// - Designed to be used only for header sniffing/classification; not for full file parsing.
-        /// </remarks>
-        private static string ReadEntryHeadUtf8(IArchiveEntry entry, int maxBytes)
+        /// <param name="entry">The archive entry to read from.</param>
+        /// <param name="maxBytes">The maximum number of bytes to read.</param>
+        /// <returns>The UTF-8 decoded header content, or an empty string on error.</returns>
+        private static string ReadEntryHeaderUtf8(IArchiveEntry entry, int maxBytes)
         {
             try
             {
-                using (var s = entry.OpenEntryStream())
-                using (var ms = new MemoryStream())
+                using (var stream = entry.OpenEntryStream())
+                using (var buffer = new MemoryStream())
                 {
-                    var buffer = new byte[8192];
+                    var temp = new byte[4096];
                     int remaining = maxBytes;
                     int read;
-                    while (remaining > 0 && (read = s.Read(buffer, 0, Math.Min(buffer.Length, remaining))) > 0)
+
+                    while (remaining > 0 && (read = stream.Read(temp, 0, Math.Min(temp.Length, remaining))) > 0)
                     {
-                        ms.Write(buffer, 0, read);
+                        buffer.Write(temp, 0, read);
                         remaining -= read;
                     }
-                    return Encoding.UTF8.GetString(ms.ToArray());
+
+                    return Encoding.UTF8.GetString(buffer.ToArray());
                 }
             }
             catch (Exception ex)
             {
-                Log.Debug("ReadEntryHeadUtf8: failed to read entry '" + (entry?.Key ?? "<null>") + "': " + ex.Message);
+                Log.Debug($"ReadEntryHeaderUtf8 failed for '{entry?.Key ?? "<null>"}': {ex.Message}");
                 return string.Empty;
             }
         }
